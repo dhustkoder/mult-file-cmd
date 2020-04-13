@@ -11,6 +11,8 @@
 #define log(...) do { fprintf(stdout, __VA_ARGS__); fprintf(stdout, "\n"); } while (0)
 #define log_error(...) do { fprintf(stderr, __VA_ARGS__); fprintf(stderr, "\n"); } while (0)
 
+#define NTHREADS 4
+#define CMD_BUFFER_SIZE 512
 
 struct command {
 	const char* prog;
@@ -25,10 +27,85 @@ struct directory {
 	int nfiles;
 };
 
+struct command_pool {
+	char* cmds;
+	int ncmds;
+};
+
 
 static struct directory directory;
 static struct command command;
-static pthread_mutex_t lock;
+static struct command_pool cmdpools[NTHREADS];
+static int files_per_thread;
+static int last_thread_leftover;
+
+
+
+
+static bool strcat_next_file_path(char** dest)
+{
+	struct dirent* entry;
+
+	while ((entry = readdir(directory.dirp)) != NULL) {
+		/* check if it is a regular file (not a directory etc...) */
+		if (entry->d_type == DT_REG)
+			break;
+	}
+
+	if (entry != NULL)
+		strcat(*dest, entry->d_name);
+
+	return entry != NULL;
+}
+
+
+static bool setup_command_pool(struct command_pool* const pool)
+{
+	/* allocate enough bytes for all commands in this pool */
+	pool->ncmds = pool == &cmdpools[NTHREADS - 1] 
+		? files_per_thread + last_thread_leftover
+		: files_per_thread;
+
+	const size_t pool_size = sizeof(char) * pool->ncmds * CMD_BUFFER_SIZE + 1;
+	pool->cmds = malloc(pool_size);
+	if (pool->cmds == NULL) {
+		log_error("couldn't enough allocate memory");
+		return false;
+	}
+
+	/* set all bytes to 0 */
+	memset(pool->cmds, 0, pool_size);
+
+	/* add the PRE filename ( $ ) arguments for all commands in this pool */
+	char* bufp = pool->cmds;
+	for (int i = 0; i < pool->ncmds; ++i) {
+		strcpy(bufp, command.prog);
+		for (int i = 0; i < command.phidx; ++i) {
+			strcat(bufp, " ");
+			strcat(bufp, command.args[i]);
+		}
+
+		bufp += CMD_BUFFER_SIZE;
+	}
+
+	/* add the filenames and the next arguments after the filenames to all commands in this pool */
+	bufp = pool->cmds;
+	for (int i = 0; i < pool->ncmds; ++i) {
+		strcat(bufp, " ");
+		strcat(bufp, directory.path);
+		strcat(bufp, "/");
+		strcat_next_file_path(&bufp);
+
+		for (int i = command.phidx + 1; i < command.nargs; ++i) {
+			strcat(bufp, " ");
+			strcat(bufp, command.args[i]);
+		}
+
+		bufp += CMD_BUFFER_SIZE;
+	}
+
+	return true;
+}
 
 static bool mfcmd_init(int argc, char** argv)
 {
@@ -84,22 +161,26 @@ static bool mfcmd_init(int argc, char** argv)
 		goto Lclosedir;
 	}
 
-	/* initialize the mutex for multi threaded calls */
-	if (pthread_mutex_init(&lock, NULL) != 0) {
-		log_error("failed to init mutex");
-		goto Lclosedir;
+	files_per_thread = directory.nfiles / NTHREADS;
+	last_thread_leftover = directory.nfiles % NTHREADS;
+
+	for (int i = 0; i < NTHREADS - 1; ++i) {
+		if (!setup_command_pool(&cmdpools[i])) {
+			goto Lclean_pools;
+		}
 	}
 
-	log(
-		"INFO: \n"
-		"DIRECTORY: %s\n"
-		"NUMBER OF FILES TO PROCESS: %d",
-		directory.path,
-		directory.nfiles
-	);
-
+	if (!setup_command_pool(&cmdpools[NTHREADS - 1])) {
+		goto Lclean_pools;
+	}
 
 	return true;
+
+Lclean_pools:
+	for (int i = 0; i < NTHREADS; ++i) {
+		if (cmdpools[i].cmds != NULL)
+			free(cmdpools[i].cmds);
+	}
 
 Lclosedir:
 	closedir(directory.dirp);
@@ -110,65 +191,59 @@ Lclosedir:
 
 static void mfcmd_term(void)
 {
+	for (int i = 0; i < NTHREADS; ++i) {
+		if (cmdpools[i].cmds != NULL)
+			free(cmdpools[i].cmds);
+	}
 	closedir(directory.dirp);
 }
 
-
-static bool fetch_next_file(char** dest)
+static void* command_executer(void* cmdpool_addr)
 {
-	pthread_mutex_lock(&lock);
+	const struct command_pool* const pool = cmdpool_addr;
 
-	struct dirent* entry;
-
-	while ((entry = readdir(directory.dirp)) != NULL) {
-		/* check if it is a regular file (not a directory etc...) */
-		if (entry->d_type == DT_REG)
-			break;
-	}
-
-	if (entry != NULL) 
-		strcpy(*dest, entry->d_name);
-
-	pthread_mutex_unlock(&lock);
-
-	return entry != NULL;
-}
-
-
-static void* command_executer(void* dum)
-{
-	char cmdbuffer[256] = { 0 };
-	char pathbuffer[256] = { 0 };
-	char result[512] = { 0 };
-	char* p = pathbuffer;
-
-	/* prepare the PRE filename arguments for the command */
-	strcpy(cmdbuffer, command.prog);
-	for (int i = 0; i < command.phidx; ++i) {
-		strcat(cmdbuffer, " ");
-		strcat(cmdbuffer, command.args[i]);
-	}
-
-	while (fetch_next_file(&p)) {
-		strcpy(result, cmdbuffer);
-		
-		strcat(result, " ");
-		strcat(result, directory.path);
-		strcat(result, "/");
-		strcat(result, p);
-
-		/* add the next arguments after the filename */
-		for (int i = command.phidx + 1; i < command.nargs; ++i) {
-			strcat(result, " ");
-			strcat(result, command.args[i]);
-		}
-
-		/* execute the command */
-		system(result);
+	const char* p = pool->cmds;
+	for (int i = 0; i < pool->ncmds; ++i) {
+		system(p);
+		p += CMD_BUFFER_SIZE;
 	}
 
 	return NULL;
 }
+
+static void mfcmd_run(void)
+{
+	log(
+		"INFO: \n"
+		"DIRECTORY: %s\n"
+		"NUMBER OF FILES TO PROCESS: %d\n"
+		"NUMBER OF THREADS: %d\n"
+		"FILES PER THREAD: %d + %d ON LAST THREAD\n",
+		directory.path,
+		directory.nfiles,
+		NTHREADS,
+		files_per_thread,
+		last_thread_leftover
+	);
+	
+	log("press y to confirm and RUN");
+
+	char c = getchar();
+
+	if (c !='y')
+		return;
+
+	pthread_t thr[NTHREADS - 1];
+
+	for (int i = 0; i < NTHREADS - 1; ++i)
+		pthread_create(&thr[i], NULL, &command_executer, &cmdpools[i]);
+
+	command_executer(&cmdpools[NTHREADS - 1]);
+
+	for (int i = 0; i < NTHREADS - 1; ++i)
+		pthread_join(thr[i], NULL);
+}
+
 
 
 int main(int argc, char** argv)
@@ -178,22 +253,11 @@ int main(int argc, char** argv)
 		return EXIT_FAILURE;
 	}
 
-	if (!mfcmd_init(argc, argv)) {
+	if (!mfcmd_init(argc, argv))
 		return EXIT_FAILURE;
-	}
-
-	pthread_t thr[4];
-
-	pthread_create(&thr[0], NULL, &command_executer, NULL);
-	pthread_create(&thr[1], NULL, &command_executer, NULL);
-	pthread_create(&thr[2], NULL, &command_executer, NULL);
-	pthread_create(&thr[3], NULL, &command_executer, NULL);
 
 
-	pthread_join(thr[0], NULL);
-	pthread_join(thr[1], NULL);
-	pthread_join(thr[2], NULL);
-	pthread_join(thr[3], NULL);
+	mfcmd_run();
 
 	mfcmd_term();
 	return EXIT_SUCCESS;

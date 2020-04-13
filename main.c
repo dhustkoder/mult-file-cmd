@@ -84,6 +84,7 @@ static bool mfcmd_init(int argc, char** argv)
 		goto Lclosedir;
 	}
 
+	/* initialize the mutex for multi threaded calls */
 	if (pthread_mutex_init(&lock, NULL) != 0) {
 		log_error("failed to init mutex");
 		goto Lclosedir;
@@ -120,6 +121,7 @@ static bool fetch_next_file(char** dest)
 	struct dirent* entry;
 
 	while ((entry = readdir(directory.dirp)) != NULL) {
+		/* check if it is a regular file (not a directory etc...) */
 		if (entry->d_type == DT_REG)
 			break;
 	}
@@ -140,6 +142,7 @@ static void* command_executer(void* dum)
 	char result[512] = { 0 };
 	char* p = pathbuffer;
 
+	/* prepare the PRE filename arguments for the command */
 	strcpy(cmdbuffer, command.prog);
 	for (int i = 0; i < command.phidx; ++i) {
 		strcat(cmdbuffer, " ");
@@ -148,14 +151,19 @@ static void* command_executer(void* dum)
 
 	while (fetch_next_file(&p)) {
 		strcpy(result, cmdbuffer);
+		
 		strcat(result, " ");
 		strcat(result, directory.path);
 		strcat(result, "/");
 		strcat(result, p);
+
+		/* add the next arguments after the filename */
 		for (int i = command.phidx + 1; i < command.nargs; ++i) {
 			strcat(result, " ");
 			strcat(result, command.args[i]);
 		}
+
+		/* execute the command */
 		system(result);
 	}
 

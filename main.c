@@ -12,13 +12,13 @@
 #define log_error(...) do { fprintf(stderr, __VA_ARGS__); fprintf(stderr, "\n"); } while (0)
 
 #define NTHREADS 4
-#define CMD_BUFFER_SIZE 512
+#define CMD_BUFFER_SIZE 1024
+#define FILEPATHS_INIT_SIZE (1024 * 16)
 
 struct command {
 	const char* prog;
 	char** args;
 	int nargs;
-	int phidx;
 };
 
 struct directory {
@@ -28,8 +28,10 @@ struct directory {
 };
 
 struct command_pool {
-	char* cmds;
-	int ncmds;
+	int nfiles;
+	short* filepathlens;
+	char* filepaths;
+	char cmdbuffer[CMD_BUFFER_SIZE];
 };
 
 
@@ -40,9 +42,7 @@ static int files_per_thread;
 static int last_thread_leftover;
 
 
-
-
-static bool strcat_next_file_path(char** dest)
+static bool strcpy_next_file_path(char* dest)
 {
 	struct dirent* entry;
 
@@ -53,59 +53,74 @@ static bool strcat_next_file_path(char** dest)
 	}
 
 	if (entry != NULL)
-		strcat(*dest, entry->d_name);
+		strcpy(dest, entry->d_name);
 
 	return entry != NULL;
 }
 
 
-static bool setup_command_pool(struct command_pool* const pool)
+static bool setup_command_pool(
+		struct command_pool* const pool,
+		const int nfiles
+)
 {
-	/* allocate enough bytes for all commands in this pool */
-	pool->ncmds = pool == &cmdpools[NTHREADS - 1] 
-		? files_per_thread + last_thread_leftover
-		: files_per_thread;
-
-	const size_t pool_size = sizeof(char) * pool->ncmds * CMD_BUFFER_SIZE + 1;
-	pool->cmds = malloc(pool_size);
-	if (pool->cmds == NULL) {
-		log_error("couldn't enough allocate memory");
+	pool->nfiles = nfiles;
+	pool->filepathlens = malloc(sizeof(*pool->filepathlens) * pool->nfiles);
+	if (pool->filepathlens == NULL) {
+		log_error("coulndn't allocate enough memory");
+		return false;
+	}
+	pool->filepaths = malloc(sizeof(*pool->filepaths) * FILEPATHS_INIT_SIZE);
+	if (pool->filepaths == NULL) {
+		log_error("couldn't allocate enough memory");
+		free(pool->filepathlens);
+		pool->filepathlens = NULL;
 		return false;
 	}
 
-	/* set all bytes to 0 */
-	memset(pool->cmds, 0, pool_size);
+	strcpy(pool->cmdbuffer, command.prog);
+	for (int i = 0; i < command.nargs - 1; ++i) {
+		strcat(pool->cmdbuffer, " ");
+		strcat(pool->cmdbuffer, command.args[i]);
+	}
+	strcat(pool->cmdbuffer, " ");
+	strcat(pool->cmdbuffer, directory.path);
+	strcat(pool->cmdbuffer, "/");
 
-	/* add the PRE filename ( $ ) arguments for all commands in this pool */
-	char* bufp = pool->cmds;
-	for (int i = 0; i < pool->ncmds; ++i) {
-		strcpy(bufp, command.prog);
-		for (int i = 0; i < command.phidx; ++i) {
-			strcat(bufp, " ");
-			strcat(bufp, command.args[i]);
+	char filepath[512] = { 0 };
+	size_t filepaths_data_size = 0;
+	size_t filepaths_buffer_size = FILEPATHS_INIT_SIZE;
+	char* filepaths_writer = pool->filepaths;
+	for (int i = 0; i < pool->nfiles; ++i) {
+		strcpy_next_file_path(filepath);
+		const int filepathlen = strlen(filepath);
+		pool->filepathlens[i] = filepathlen;
+		filepaths_data_size += filepathlen;
+		if (filepaths_data_size > filepaths_buffer_size) {
+			const size_t newsize = filepaths_data_size * 2;
+			const size_t writer_pos = filepaths_writer - pool->filepaths;
+			pool->filepaths = realloc(pool->filepaths, newsize); 
+			if (pool->filepaths == NULL) {
+				log_error("couldn't allocate enough memory");
+				free(pool->filepaths);
+				free(pool->filepathlens);
+				pool->filepaths = NULL;
+				pool->filepathlens = NULL;
+				return false;
+			}
+			filepaths_buffer_size = newsize;
+			filepaths_writer = pool->filepaths + writer_pos;
 		}
-
-		bufp += CMD_BUFFER_SIZE;
+		memcpy(filepaths_writer, filepath, filepathlen);
+		filepaths_writer += filepathlen;
 	}
 
-	/* add the filenames and the next arguments after the filenames to all commands in this pool */
-	bufp = pool->cmds;
-	for (int i = 0; i < pool->ncmds; ++i) {
-		strcat(bufp, " ");
-		strcat(bufp, directory.path);
-		strcat(bufp, "/");
-		strcat_next_file_path(&bufp);
-
-		for (int i = command.phidx + 1; i < command.nargs; ++i) {
-			strcat(bufp, " ");
-			strcat(bufp, command.args[i]);
-		}
-
-		bufp += CMD_BUFFER_SIZE;
-	}
+	pool->filepaths = realloc(pool->filepaths, filepaths_data_size);
 
 	return true;
 }
+
+static void mfcmd_term(void);
 
 static bool mfcmd_init(int argc, char** argv)
 {
@@ -147,17 +162,20 @@ static bool mfcmd_init(int argc, char** argv)
 
 	command.args = argv + 3;
 	command.nargs = argc - 3;
-	command.phidx = -1;
 
+	int phidx = -1;
 	/* find the placeholder index in argument list */
 	for (int i = 0; i < command.nargs; ++i) {
 		if (strcmp(command.args[i], "$") == 0)
-			command.phidx = i;
+			phidx = i;
 	}
 
-	if (command.phidx == -1) {
-		log_error("file placeholder not found in argument list.\n"
-		          "use $ for specifying the file in the command argument list");
+	if (phidx != command.nargs - 1) {
+		log_error(
+			"file placeholder not found in argument list.\n"
+			"use $ for specifying the file in the command argument list.\n"
+			"$ should be the last argument in argument list."
+		);
 		goto Lclosedir;
 	}
 
@@ -165,26 +183,19 @@ static bool mfcmd_init(int argc, char** argv)
 	last_thread_leftover = directory.nfiles % NTHREADS;
 
 	for (int i = 0; i < NTHREADS - 1; ++i) {
-		if (!setup_command_pool(&cmdpools[i])) {
+		if (!setup_command_pool(&cmdpools[i], files_per_thread)) {
 			goto Lclean_pools;
 		}
 	}
 
-	if (!setup_command_pool(&cmdpools[NTHREADS - 1])) {
+	if (!setup_command_pool(&cmdpools[NTHREADS - 1], files_per_thread + last_thread_leftover)) 
 		goto Lclean_pools;
-	}
 
 	return true;
 
 Lclean_pools:
-	for (int i = 0; i < NTHREADS; ++i) {
-		if (cmdpools[i].cmds != NULL)
-			free(cmdpools[i].cmds);
-	}
-
 Lclosedir:
-	closedir(directory.dirp);
-
+	mfcmd_term();
 	return false;
 }
 
@@ -192,20 +203,30 @@ Lclosedir:
 static void mfcmd_term(void)
 {
 	for (int i = 0; i < NTHREADS; ++i) {
-		if (cmdpools[i].cmds != NULL)
-			free(cmdpools[i].cmds);
+		if (cmdpools[i].filepaths != NULL)
+			free(cmdpools[i].filepaths);
+		if (cmdpools[i].filepathlens != NULL)
+			free(cmdpools[i].filepathlens);
 	}
-	closedir(directory.dirp);
+	if (directory.dirp != NULL)
+		closedir(directory.dirp);
 }
 
 static void* command_executer(void* cmdpool_addr)
 {
-	const struct command_pool* const pool = cmdpool_addr;
+	struct command_pool* const pool = cmdpool_addr;
 
-	const char* p = pool->cmds;
-	for (int i = 0; i < pool->ncmds; ++i) {
-		system(p);
-		p += CMD_BUFFER_SIZE;
+	char* cmdbuffer_write_pos = pool->cmdbuffer + strlen(pool->cmdbuffer);
+	const char* filepaths_reader = pool->filepaths;
+	for (int i = 0; i < pool->nfiles; ++i) {
+		memcpy(
+			cmdbuffer_write_pos,
+			filepaths_reader,
+			pool->filepathlens[i]
+		);
+		*(cmdbuffer_write_pos + pool->filepathlens[i]) = '\0';
+		filepaths_reader += pool->filepathlens[i];
+		system(pool->cmdbuffer);
 	}
 
 	return NULL;
